@@ -1,0 +1,8 @@
+.App button {
+  padding: 10px 12px;
+  border: 1px solid #ddd;
+  border-radius: 10px;
+  background: #fafafa;
+}
+.App button:disabled { opacity: 0.5; cursor: not-allowed; }
+.App input[type="range"] { width: 100%; }

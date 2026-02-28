@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+*.db
+.venv/
+
+# Node
+node_modules/
+build/
+
+# Docker data (db + mp3)
+data/
+
+# OS
+.DS_Store
+Thumbs.db
