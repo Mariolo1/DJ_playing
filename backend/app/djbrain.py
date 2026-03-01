@@ -3,8 +3,15 @@ import math
 import random
 import sqlite3
 
-def pick_next(conn: sqlite3.Connection, current_id: int | None, target_energy: float, history: list[int]) -> dict | None:
-    rows = conn.execute("SELECT * FROM tracks WHERE analyzed=1").fetchall()
+def pick_next(
+    conn: sqlite3.Connection,
+    current_id: int | None,
+    target_energy: float,
+    history: list[int],
+) -> dict | None:
+    rows = conn.execute(
+        "SELECT * FROM tracks WHERE analyzed=1 AND (deleted IS NULL OR deleted=0)"
+    ).fetchall()
     if not rows:
         return None
 
@@ -13,8 +20,10 @@ def pick_next(conn: sqlite3.Connection, current_id: int | None, target_energy: f
         current = conn.execute("SELECT * FROM tracks WHERE id=?", (current_id,)).fetchone()
 
     def score(r) -> float:
-        if r["id"] in history:
+        # Nie wybieraj bieżącego tracka ani nic z historii
+        if (current_id is not None and r["id"] == current_id) or (r["id"] in history):
             return -1e9
+
         s = 0.0
 
         r_energy = float(r["energy"] or 0.0)
@@ -30,5 +39,15 @@ def pick_next(conn: sqlite3.Connection, current_id: int | None, target_energy: f
         s += random.uniform(-0.05, 0.05)
         return s
 
-    best = max(rows, key=score)
-    return dict(best)
+    scored = [(score(r), r) for r in rows]
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # odfiltruj zablokowane (-1e9)
+    scored = [x for x in scored if x[0] > -1e8]
+    if not scored:
+        return None
+
+    # losuj z TOP-5, żeby nie kleiło się do jednego utworu
+    K = min(5, len(scored))
+    _, chosen = random.choice(scored[:K])
+    return dict(chosen)

@@ -4,6 +4,10 @@ import "./App.css";
 const DEFAULT_MIX_INTERVAL_SEC = 70;
 const DEFAULT_FADE_SEC = 10;
 
+// Backend URL z .env (dla laptopa + serwer):
+// frontend/.env -> REACT_APP_API_URL=http://IP_SERWERA:8000
+const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:8000";
+
 function clamp(x, a, b) {
   return Math.max(a, Math.min(b, x));
 }
@@ -14,7 +18,7 @@ export default function App() {
   const [analyzing, setAnalyzing] = useState(false);
 
   const [isRunning, setIsRunning] = useState(false);
-  const [targetEnergy, setTargetEnergy] = useState(0.65);
+  const [targetEnergy, setTargetEnergy] = useState(0.65); // tylko UI
   const [mixIntervalSec, setMixIntervalSec] = useState(DEFAULT_MIX_INTERVAL_SEC);
   const [fadeSec, setFadeSec] = useState(DEFAULT_FADE_SEC);
 
@@ -25,23 +29,31 @@ export default function App() {
   const [showTrash, setShowTrash] = useState(false);
   const [selected, setSelected] = useState(new Set()); // track ids
 
-  const historyRef = useRef([]);
+  // audio
   const audioCtxRef = useRef(null);
   const gainARef = useRef(null);
   const gainBRef = useRef(null);
   const deckARef = useRef(null);
   const deckBRef = useRef(null);
   const activeDeckRef = useRef("A");
-  const timerRef = useRef(null);
 
+  // timer + transition guard
+  const timerRef = useRef(null);
+  const transitioningRef = useRef(false);
+
+  // STABILNA PLAYLISTA (zamrożona na start)
+  const playlistRef = useRef([]); // [{id,...}, ...] posortowane po ID
+  const indexRef = useRef(0); // index aktualnego "now playing" w playlistRef
+
+  // ------- API helpers -------
   async function apiGet(path) {
-    const res = await fetch(path);
+    const res = await fetch(`${API_BASE}${path}`);
     if (!res.ok) throw new Error(await res.text());
     return await res.json();
   }
 
   async function apiPostJson(path, obj) {
-    const res = await fetch(path, {
+    const res = await fetch(`${API_BASE}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(obj),
@@ -51,20 +63,19 @@ export default function App() {
   }
 
   async function apiPostForm(path, body) {
-    const res = await fetch(path, { method: "POST", body });
+    const res = await fetch(`${API_BASE}${path}`, { method: "POST", body });
     if (!res.ok) throw new Error(await res.text());
     return await res.json();
   }
 
   async function apiDelete(path) {
-    const res = await fetch(path, { method: "DELETE" });
+    const res = await fetch(`${API_BASE}${path}`, { method: "DELETE" });
     if (!res.ok) throw new Error(await res.text());
     return await res.json();
   }
 
   async function refreshTracks(nextShowTrash = showTrash) {
     const list = await apiGet(`/tracks?include_deleted=${nextShowTrash ? "true" : "false"}`);
-    // jak showTrash=true pokazujemy wszystko, ale UI filtruje:
     setTracks(list);
   }
 
@@ -79,6 +90,14 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showTrash]);
 
+  // ------- playlist builder (ID rosnąco) -------
+  function buildPlaylistFromTracks() {
+    return tracks
+      .filter((t) => (t.deleted || 0) === 0 && t.analyzed === 1)
+      .sort((a, b) => a.id - b.id);
+  }
+
+  // ------- audio graph -------
   function ensureAudioGraph() {
     if (audioCtxRef.current) return;
 
@@ -101,6 +120,54 @@ export default function App() {
     gainBRef.current = gainB;
   }
 
+  // ------- timer: łańcuch setTimeout (bez setInterval) -------
+  function stopTimer() {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+  }
+
+  useEffect(() => {
+    if (!isRunning) return;
+
+    stopTimer();
+    const schedule = () => {
+      timerRef.current = setTimeout(async () => {
+        await doTransition().catch(console.error);
+        schedule();
+      }, mixIntervalSec * 1000);
+    };
+
+    schedule();
+    return () => stopTimer();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isRunning, mixIntervalSec]);
+
+  // ------- ended event: gdy utwór skończy się wcześniej niż mixInterval -------
+  useEffect(() => {
+    const a = deckARef.current;
+    const b = deckBRef.current;
+    if (!a || !b) return;
+
+    const onEndedA = () => {
+      if (isRunning && activeDeckRef.current === "A") doTransition().catch(console.error);
+    };
+    const onEndedB = () => {
+      if (isRunning && activeDeckRef.current === "B") doTransition().catch(console.error);
+    };
+
+    a.addEventListener("ended", onEndedA);
+    b.addEventListener("ended", onEndedB);
+
+    return () => {
+      a.removeEventListener("ended", onEndedA);
+      b.removeEventListener("ended", onEndedB);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isRunning, nowPlaying, nextUp, fadeSec, mixIntervalSec]);
+
+  // ------- actions -------
   async function handleUpload(files) {
     if (!files || files.length === 0) return;
     setUploading(true);
@@ -130,44 +197,16 @@ export default function App() {
     }
   }
 
-  async function fetchNext(currentId) {
-    const history = historyRef.current.join(",");
-    const params = new URLSearchParams();
-    if (currentId !== null && currentId !== undefined) params.set("current_id", String(currentId));
-    params.set("target_energy", String(targetEnergy));
-    params.set("history", history);
-    return await apiGet(`/set/next?${params.toString()}`);
-  }
-
-  useEffect(() => {
-    if (!isRunning || !nowPlaying) return;
-    fetchNext(nowPlaying.id).then(setNextUp).catch(() => {});
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [targetEnergy]);
-
-  function stopTimer() {
-    if (timerRef.current) {
-      clearInterval(timerRef.current);
-      timerRef.current = null;
-    }
-  }
-
-  useEffect(() => {
-    if (!isRunning) return;
-    stopTimer();
-    timerRef.current = setInterval(() => {
-      doTransition().catch(console.error);
-    }, mixIntervalSec * 1000);
-    return () => stopTimer();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isRunning, mixIntervalSec]);
-
   async function stopSet() {
     stopTimer();
     setIsRunning(false);
     setNowPlaying(null);
     setNextUp(null);
-    historyRef.current = [];
+    transitioningRef.current = false;
+
+    // wyczyść playlistę
+    playlistRef.current = [];
+    indexRef.current = 0;
 
     try {
       deckARef.current?.pause();
@@ -184,32 +223,38 @@ export default function App() {
     ensureAudioGraph();
     await audioCtxRef.current.resume();
 
-    const active = tracks.filter((t) => (t.deleted || 0) === 0);
-    const analyzed = active.filter((t) => t.analyzed === 1);
-
-    if (analyzed.length < 2) {
-      alert("Najpierw wrzuć i przeanalizuj co najmniej 2 utwory (Analyze).");
+    const list = buildPlaylistFromTracks();
+    if (list.length < 2) {
+      alert("Potrzebujesz co najmniej 2 aktywnych i przeanalizowanych utworów.");
       return;
     }
 
-    historyRef.current = [];
+    playlistRef.current = list;
+    indexRef.current = 0;
     activeDeckRef.current = "A";
+    transitioningRef.current = false;
 
     try {
-      const first = await fetchNext(null);
-      historyRef.current.push(first.id);
+      const first = list[0];
+      const second = list[1];
+
       setNowPlaying(first);
+      setNextUp(second);
 
       const deckA = deckARef.current;
-      deckA.src = `/tracks/${first.id}/stream`;
+      deckA.src = `${API_BASE}/tracks/${first.id}/stream`;
       deckA.playbackRate = 1.0;
-      await deckA.play();
 
-      const next = await fetchNext(first.id);
-      setNextUp(next);
+      try {
+        await deckA.play();
+      } catch (e) {
+        console.error("deckA.play failed", e);
+        alert("Nie mogę rozpocząć odtwarzania (play blocked). Kliknij jeszcze raz START SET.");
+        return;
+      }
 
       const deckB = deckBRef.current;
-      deckB.src = `/tracks/${next.id}/stream`;
+      deckB.src = `${API_BASE}/tracks/${second.id}/stream`;
       deckB.playbackRate = 1.0;
       deckB.load();
 
@@ -221,60 +266,98 @@ export default function App() {
 
   async function doTransition() {
     if (!isRunning || !nowPlaying || !nextUp) return;
+    if (transitioningRef.current) return;
+    transitioningRef.current = true;
 
-    const deckA = deckARef.current;
-    const deckB = deckBRef.current;
-    const gainA = gainARef.current;
-    const gainB = gainBRef.current;
+    try {
+      const deckA = deckARef.current;
+      const deckB = deckBRef.current;
+      const gainA = gainARef.current;
+      const gainB = gainBRef.current;
 
-    const active = activeDeckRef.current;
-    const fromDeck = active === "A" ? deckA : deckB;
-    const toDeck = active === "A" ? deckB : deckA;
-    const fromGain = active === "A" ? gainA : gainB;
-    const toGain = active === "A" ? gainB : gainA;
+      const active = activeDeckRef.current;
+      const fromDeck = active === "A" ? deckA : deckB;
+      const toDeck = active === "A" ? deckB : deckA;
+      const fromGain = active === "A" ? gainA : gainB;
+      const toGain = active === "A" ? gainB : gainA;
 
-    const fromBpm = nowPlaying.bpm || 120;
-    const toBpm = nextUp.bpm || 120;
-    const rate = clamp(fromBpm / toBpm, 0.85, 1.15);
-    toDeck.playbackRate = rate;
+      // tempo sync (kosmetyczne)
+      const fromBpm = nowPlaying.bpm || 120;
+      const list = playlistRef.current;
+      const currentNext = list && list.length > 1 ? list[(indexRef.current + 1) % list.length] : nextUp;
+      const toBpm = currentNext?.bpm || 120;
+      const rate = clamp(fromBpm / toBpm, 0.85, 1.15);
+      toDeck.playbackRate = rate;
 
-    if (toDeck.paused) await toDeck.play();
+      if (toDeck.paused) {
+        try {
+          await toDeck.play();
+        } catch (e) {
+          console.error("toDeck.play failed", e);
+        }
+      }
 
-    const ctx = audioCtxRef.current;
-    const now = ctx.currentTime;
+      const ctx = audioCtxRef.current;
+      const now = ctx.currentTime;
 
-    fromGain.gain.cancelScheduledValues(now);
-    toGain.gain.cancelScheduledValues(now);
+      fromGain.gain.cancelScheduledValues(now);
+      toGain.gain.cancelScheduledValues(now);
 
-    fromGain.gain.setValueAtTime(fromGain.gain.value, now);
-    toGain.gain.setValueAtTime(toGain.gain.value, now);
+      fromGain.gain.setValueAtTime(fromGain.gain.value, now);
+      toGain.gain.setValueAtTime(toGain.gain.value, now);
 
-    fromGain.gain.linearRampToValueAtTime(0.0, now + fadeSec);
-    toGain.gain.linearRampToValueAtTime(1.0, now + fadeSec);
+      fromGain.gain.linearRampToValueAtTime(0.0, now + fadeSec);
+      toGain.gain.linearRampToValueAtTime(1.0, now + fadeSec);
 
-    setTimeout(async () => {
-      try {
-        fromDeck.pause();
-        fromDeck.currentTime = 0;
-      } catch {}
+      setTimeout(async () => {
+        try {
+          try {
+            fromDeck.pause();
+            fromDeck.currentTime = 0;
+          } catch {}
 
-      activeDeckRef.current = active === "A" ? "B" : "A";
+          activeDeckRef.current = active === "A" ? "B" : "A";
 
-      setNowPlaying(nextUp);
-      historyRef.current.push(nextUp.id);
+          // --- przesuń indeks w zamrożonej playliście ---
+          const list2 = playlistRef.current;
+          if (!list2 || list2.length < 2) {
+            stopSet();
+            return;
+          }
 
-      const newNext = await fetchNext(nextUp.id);
-      setNextUp(newNext);
+          // przechodzimy na kolejny utwór (źródło prawdy = playlistRef)
+          indexRef.current = (indexRef.current + 1) % list2.length;
 
-      const inactiveDeck = active === "A" ? deckA : deckB;
-      inactiveDeck.src = `/tracks/${newNext.id}/stream`;
-      inactiveDeck.playbackRate = 1.0;
-      inactiveDeck.load();
-    }, fadeSec * 1000 + 200);
+          const nowTrack = list2[indexRef.current];
+          const nextIndex = (indexRef.current + 1) % list2.length;
+          const newNext = list2[nextIndex];
+
+          // ✅ UI aktualizujemy z playlisty
+          setNowPlaying(nowTrack);
+          setNextUp(newNext);
+
+          // --- załaduj newNext na nieaktywny deck ---
+          const inactiveDeck = active === "A" ? deckA : deckB;
+          inactiveDeck.src = `${API_BASE}/tracks/${newNext.id}/stream`;
+          inactiveDeck.playbackRate = 1.0;
+          inactiveDeck.load();
+        } catch (e) {
+          console.error("transition callback failed", e);
+          alert("Błąd przejścia: " + (e?.message || e));
+          stopSet();
+        } finally {
+          transitioningRef.current = false;
+        }
+      }, fadeSec * 1000 + 200);
+    } catch (e) {
+      console.error("doTransition failed", e);
+      alert("Błąd przejścia: " + (e?.message || e));
+      stopSet();
+      transitioningRef.current = false;
+    }
   }
 
   // ---------- PRO: selection + kosz ----------
-
   const playingIds = new Set([nowPlaying?.id, nextUp?.id].filter(Boolean));
 
   const visibleTracks = showTrash
@@ -437,18 +520,39 @@ export default function App() {
 
       <div style={{ marginTop: 16, display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
         <label style={{ display: "grid", gap: 6 }}>
-          <span>Energy target: {targetEnergy.toFixed(2)}</span>
-          <input type="range" min="0" max="1" step="0.01" value={targetEnergy} onChange={(e) => setTargetEnergy(parseFloat(e.target.value))} />
+          <span>Energy target: {targetEnergy.toFixed(2)} (UI)</span>
+          <input
+            type="range"
+            min="0"
+            max="1"
+            step="0.01"
+            value={targetEnergy}
+            onChange={(e) => setTargetEnergy(parseFloat(e.target.value))}
+          />
         </label>
 
         <label style={{ display: "grid", gap: 6 }}>
           <span>Mix interval (s): {mixIntervalSec}</span>
-          <input type="range" min="15" max="180" step="5" value={mixIntervalSec} onChange={(e) => setMixIntervalSec(parseInt(e.target.value, 10))} />
+          <input
+            type="range"
+            min="15"
+            max="180"
+            step="5"
+            value={mixIntervalSec}
+            onChange={(e) => setMixIntervalSec(parseInt(e.target.value, 10))}
+          />
         </label>
 
         <label style={{ display: "grid", gap: 6 }}>
           <span>Fade (s): {fadeSec}</span>
-          <input type="range" min="4" max="20" step="1" value={fadeSec} onChange={(e) => setFadeSec(parseInt(e.target.value, 10))} />
+          <input
+            type="range"
+            min="4"
+            max="20"
+            step="1"
+            value={fadeSec}
+            onChange={(e) => setFadeSec(parseInt(e.target.value, 10))}
+          />
         </label>
       </div>
 
@@ -457,15 +561,17 @@ export default function App() {
           Widoczne: {visibleTracks.length} | zaznaczone: {selected.size}
         </div>
 
-        <button onClick={selectAllVisible} disabled={visibleTracks.length === 0}>Zaznacz wszystko</button>
-        <button onClick={clearSelection} disabled={selected.size === 0}>Wyczyść zaznaczenie</button>
+        <button onClick={selectAllVisible} disabled={visibleTracks.length === 0}>
+          Zaznacz wszystko
+        </button>
+        <button onClick={clearSelection} disabled={selected.size === 0}>
+          Wyczyść zaznaczenie
+        </button>
 
         {!showTrash ? (
-          <>
-            <button onClick={softDeleteSelected} disabled={selected.size === 0 || isRunning}>
-              🗑 Do kosza
-            </button>
-          </>
+          <button onClick={softDeleteSelected} disabled={selected.size === 0 || isRunning}>
+            🗑 Do kosza
+          </button>
         ) : (
           <>
             <button onClick={restoreSelected} disabled={selected.size === 0}>
@@ -486,9 +592,7 @@ export default function App() {
 
       <hr style={{ margin: "16px 0" }} />
 
-      <div style={{ fontWeight: 800, marginBottom: 8 }}>
-        Track list {showTrash ? "(Kosz)" : "(Biblioteka)"}
-      </div>
+      <div style={{ fontWeight: 800, marginBottom: 8 }}>Track list {showTrash ? "(Kosz)" : "(Biblioteka)"}</div>
 
       <div style={{ maxHeight: 360, overflow: "auto", border: "1px solid #eee", borderRadius: 12 }}>
         <table style={{ width: "100%", borderCollapse: "collapse" }}>
@@ -504,7 +608,7 @@ export default function App() {
           </thead>
           <tbody>
             {visibleTracks.map((t) => {
-              const disabled = playingIds.has(t.id) || isRunning; // blokada dla grających
+              const disabled = playingIds.has(t.id) || isRunning;
               return (
                 <tr key={t.id} style={{ opacity: disabled ? 0.75 : 1 }}>
                   <td style={{ padding: 10, borderBottom: "1px solid #f3f3f3" }}>
@@ -512,7 +616,7 @@ export default function App() {
                       type="checkbox"
                       checked={selected.has(t.id)}
                       onChange={() => toggleSelect(t.id)}
-                      disabled={disabled && !showTrash} // w bibliotece blokujemy zaznaczenie grających
+                      disabled={disabled && !showTrash}
                       title={disabled ? "Track gra / NextUp – STOP, aby usuwać" : ""}
                     />
                   </td>
@@ -531,7 +635,7 @@ export default function App() {
       </div>
 
       <div style={{ marginTop: 10, fontSize: 12, opacity: 0.7 }}>
-        PRO: Kosz + multi-select. MVP sync: playbackRate (tempo+pitch). V2: prawdziwy time-stretch.
+        Kolejność: ID rosnąco (zamrożona na START SET). Now/Next liczone z playlisty.
       </div>
     </div>
   );
