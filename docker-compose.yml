@@ -12,8 +12,8 @@ services:
       AUDIO_DIR: /app/data/audio
       MINIO_ENABLED: "true"
       MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin123
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
       MINIO_BUCKET: dj-audio
       MINIO_SECURE: "false"
     volumes:
@@ -51,8 +51,8 @@ services:
       - "9000:9000"
       - "9001:9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin123
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
       - minio_data:/data
     restart: unless-stopped
@@ -71,7 +71,7 @@ services:
         condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      /usr/bin/mc alias set local http://minio:9000 minioadmin minioadmin123 &&
+      /usr/bin/mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} &&
       /usr/bin/mc mb -p local/dj-audio || true &&
       /usr/bin/mc anonymous set private local/dj-audio || true
       "
