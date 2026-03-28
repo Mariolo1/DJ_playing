@@ -1,18 +1,19 @@
 from __future__ import annotations
 
-import shutil
 import uuid
-from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
-from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 from .db import init_db, get_conn
-from .analyze import analyze_track
-from .djbrain import pick_next
-
-AUDIO_DIR = Path("data/audio")
+from .storage import (
+    ensure_storage_ready,
+    save_upload,
+    object_exists,
+    open_stream,
+    delete_object,
+)
 
 app = FastAPI(title="Auto-DJ Backend")
 
@@ -28,7 +29,7 @@ app.add_middleware(
 @app.on_event("startup")
 def _startup():
     init_db()
-    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_storage_ready()
 
 
 @app.get("/")
@@ -44,17 +45,14 @@ async def upload_track(file: UploadFile = File(...)):
 
     original_name = file.filename or "track"
     suffix = ".mp3" if "mpeg" in ct else ".wav"
-
     stored_name = f"{uuid.uuid4().hex}{suffix}"
-    target = AUDIO_DIR / stored_name
-    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
-    with target.open("wb") as f:
-        shutil.copyfileobj(file.file, f)
-
-    if target.stat().st_size == 0:
-        target.unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail="Wgrany plik jest pusty (0 bajtów).")
+    try:
+        save_upload(file.file, stored_name, file.content_type)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
 
     with get_conn() as c:
         cur = c.execute(
@@ -66,27 +64,8 @@ async def upload_track(file: UploadFile = File(...)):
     return {"id": track_id, "stored_as": stored_name, "original_name": original_name}
 
 
-@app.post("/tracks/analyze")
-def analyze_all(include_deleted: bool = False):
-    # domyślnie analizujemy tylko aktywne (nie w koszu)
-    where = "" if include_deleted else "AND deleted=0"
-    with get_conn() as c:
-        rows = c.execute(f"SELECT * FROM tracks WHERE analyzed=0 {where}").fetchall()
-        for r in rows:
-            path = AUDIO_DIR / r["filename"]
-            if not path.exists() or path.stat().st_size == 0:
-                continue
-            meta = analyze_track(path)
-            c.execute(
-                "UPDATE tracks SET duration=?, bpm=?, energy=?, analyzed=1 WHERE id=?",
-                (meta["duration"], meta["bpm"], meta["energy"], r["id"]),
-            )
-    return {"status": "ok"}
-
-
 @app.get("/tracks")
 def list_tracks(include_deleted: bool = Query(False)):
-    # include_deleted=True -> pokaż wszystko (aktywny + kosz)
     where = "" if include_deleted else "WHERE deleted=0"
     with get_conn() as c:
         rows = c.execute(f"SELECT * FROM tracks {where} ORDER BY id DESC").fetchall()
@@ -94,35 +73,55 @@ def list_tracks(include_deleted: bool = Query(False)):
 
 
 @app.get("/set/next")
-def next_track(current_id: int | None = None, target_energy: float = 0.6, history: str = ""):
-    hist = [int(x) for x in history.split(",") if x.strip().isdigit()]
+def next_track(current_id: int | None = None):
     with get_conn() as c:
-        nxt = pick_next(c, current_id=current_id, target_energy=target_energy, history=hist)
-    if not nxt:
-        raise HTTPException(404, "Brak przeanalizowanych utworów (kliknij Analyze).")
-    return nxt
+        row = None
+
+        if current_id is not None:
+            row = c.execute(
+                "SELECT * FROM tracks WHERE deleted=0 AND id > ? ORDER BY id ASC LIMIT 1",
+                (current_id,),
+            ).fetchone()
+
+        if not row:
+            row = c.execute(
+                "SELECT * FROM tracks WHERE deleted=0 ORDER BY id ASC LIMIT 1"
+            ).fetchone()
+
+    if not row:
+        raise HTTPException(404, "Brak utworów.")
+
+    return dict(row)
 
 
 @app.get("/tracks/{track_id}/stream")
 def stream_track(track_id: int):
     with get_conn() as c:
         r = c.execute("SELECT * FROM tracks WHERE id=?", (track_id,)).fetchone()
+
     if not r:
         raise HTTPException(404, "Nie ma takiego utworu")
     if int(r["deleted"] or 0) == 1:
         raise HTTPException(410, "Utwór jest w koszu (deleted).")
 
-    path = AUDIO_DIR / r["filename"]
-    if not path.exists():
-        raise HTTPException(404, "Plik nie istnieje na dysku")
-    return FileResponse(path)
+    filename = r["filename"]
+    mime = r["mime"] or "application/octet-stream"
 
+    if not object_exists(filename):
+        raise HTTPException(404, "Plik nie istnieje w storage")
 
-# ---------- PRO: Kosz / usuwanie / przywracanie ----------
+    stream = open_stream(filename)
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": f'inline; filename="{filename}"',
+    }
+
+    return StreamingResponse(stream, media_type=mime, headers=headers)
+
 
 @app.delete("/tracks/{track_id}")
 def soft_delete_track(track_id: int):
-    # soft delete => tylko oznacz jako deleted=1, plik zostaje
     with get_conn() as c:
         row = c.execute("SELECT id FROM tracks WHERE id=?", (track_id,)).fetchone()
         if not row:
@@ -143,7 +142,6 @@ def restore_tracks(ids: list[int]):
 
 @app.post("/tracks/purge")
 def purge_tracks(ids: list[int]):
-    # hard delete => usuń z bazy i z dysku
     if not ids:
         return {"status": "ok", "purged": 0}
 
@@ -153,23 +151,18 @@ def purge_tracks(ids: list[int]):
         c.execute(f"DELETE FROM tracks WHERE id IN ({qmarks})", ids)
 
     for r in rows:
-        p = AUDIO_DIR / r["filename"]
-        if p.exists():
-            p.unlink()
+        delete_object(r["filename"])
 
     return {"status": "ok", "purged": len(rows)}
 
 
 @app.post("/tracks/purge-trash")
 def purge_trash():
-    # usuń trwale wszystko z kosza
     with get_conn() as c:
         rows = c.execute("SELECT id, filename FROM tracks WHERE deleted=1").fetchall()
         c.execute("DELETE FROM tracks WHERE deleted=1")
 
     for r in rows:
-        p = AUDIO_DIR / r["filename"]
-        if p.exists():
-            p.unlink()
+        delete_object(r["filename"])
 
     return {"status": "ok", "purged": len(rows)}
