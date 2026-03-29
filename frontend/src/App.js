@@ -16,6 +16,8 @@ function App() {
   const audioRef = useRef(null);
   const transitionTimerRef = useRef(null);
   const fadeTimerRef = useRef(null);
+  const scheduledTrackRef = useRef(null);
+  const isTransitioningRef = useRef(false);
 
   async function refreshTracks(includeDeleted = showTrash) {
     const res = await fetch(`/tracks?include_deleted=${includeDeleted}`);
@@ -51,30 +53,42 @@ function App() {
       clearTimeout(transitionTimerRef.current);
       transitionTimerRef.current = null;
     }
+
     if (fadeTimerRef.current) {
       clearInterval(fadeTimerRef.current);
       fadeTimerRef.current = null;
     }
+
+    scheduledTrackRef.current = null;
   }
 
-  function startFadeAndTransition() {
+  function startFadeAndTransition(targetTrack) {
     const audio = audioRef.current;
-    if (!audio || !nextTrack) return;
 
+    if (!audio || !targetTrack) return;
+    if (isTransitioningRef.current) return;
+
+    isTransitioningRef.current = true;
     clearTimers();
 
     const fadeMs = Math.max(0, Number(fadeSeconds) || 0) * 1000;
     const steps = 20;
     const stepMs = fadeMs > 0 ? Math.max(50, Math.floor(fadeMs / steps)) : 0;
-    const initialVolume = 1;
+    const initialVolume = typeof audio.volume === "number" ? audio.volume : 1;
 
     audio.volume = initialVolume;
 
     if (fadeMs > 0) {
       let currentStep = 0;
+
       fadeTimerRef.current = setInterval(() => {
         currentStep += 1;
-        const nextVolume = Math.max(0, initialVolume * (1 - currentStep / steps));
+
+        const nextVolume = Math.max(
+          0,
+          initialVolume * (1 - currentStep / steps)
+        );
+
         audio.volume = nextVolume;
 
         if (currentStep >= steps) {
@@ -85,19 +99,26 @@ function App() {
     }
 
     transitionTimerRef.current = setTimeout(() => {
-      playTrack(nextTrack);
-    }, fadeMs > 0 ? fadeMs : 0);
+      clearTimers();
+      playTrack(targetTrack);
+      isTransitioningRef.current = false;
+    }, fadeMs);
   }
 
   function scheduleTransition() {
     clearTimers();
 
-    if (!playing || !currentTrack || !nextTrack) return;
+    if (!playing || !currentTrack || !nextTrack || isTransitioningRef.current) {
+      return;
+    }
 
     const delayMs = Math.max(1, Number(mixInterval) || 1) * 1000;
+    const targetTrack = nextTrack;
+
+    scheduledTrackRef.current = targetTrack?.id ?? null;
 
     transitionTimerRef.current = setTimeout(() => {
-      startFadeAndTransition();
+      startFadeAndTransition(targetTrack);
     }, delayMs);
   }
 
@@ -107,23 +128,29 @@ function App() {
     clearTimers();
 
     const audio = audioRef.current;
+
     setCurrentTrack(track);
     setPlaying(true);
 
+    audio.pause();
+    audio.currentTime = 0;
     audio.volume = 1;
     audio.src = `/tracks/${track.id}/stream`;
+
     audio
       .play()
       .then(() => {
         refreshNext(track.id);
       })
       .catch(() => {
+        isTransitioningRef.current = false;
         alert("Nie udało się odtworzyć pliku.");
       });
   }
 
   function stopPlayback() {
     clearTimers();
+    isTransitioningRef.current = false;
     setPlaying(false);
 
     const audio = audioRef.current;
@@ -134,8 +161,9 @@ function App() {
     }
   }
 
-  async function handleEnded() {
+  function handleEnded() {
     clearTimers();
+    isTransitioningRef.current = false;
 
     if (nextTrack) {
       playTrack(nextTrack);
@@ -159,12 +187,15 @@ function App() {
     } else {
       refreshNext(currentTrack.id);
     }
-  }, [currentTrack, tracks]);
+  }, [currentTrack?.id, tracks.length]);
 
   useEffect(() => {
     scheduleTransition();
-    return clearTimers;
-  }, [playing, currentTrack, nextTrack, mixInterval, fadeSeconds]);
+
+    return () => {
+      clearTimers();
+    };
+  }, [playing, currentTrack?.id, nextTrack?.id, mixInterval, fadeSeconds]);
 
   async function handleUpload(event) {
     const files = Array.from(event.target.files || []);
