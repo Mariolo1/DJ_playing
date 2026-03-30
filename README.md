@@ -89,17 +89,6 @@ Set via environment variables:
 
 ---
 
-## 🎛️ How Auto-DJ Works
-
-* tracks are played **sequentially (by ID)**
-* after `mix interval` seconds:
-
-  * fade-out starts
-  * next track is loaded
-* if track ends earlier → auto-next
-
----
-
 ## ⚠️ Limitations
 
 * no BPM / beatmatching
